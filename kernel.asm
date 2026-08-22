@@ -86,15 +86,9 @@ protected_mode_start:
     ; ==========================================
 
     mov edi, [framebuffer]      
-
     mov eax, 0x00fff5ff
-    mov ecx, 0
-.fill:
-    mov dword [edi+ecx], eax
-    cmp ecx, 1920*1080*4
-    je .logo
-    add ecx, 4
-    jmp .fill
+    mov ecx, 1920*1080
+    rep stosd
 .logo:
     mov esi, msg_OSname
     cld
@@ -107,13 +101,24 @@ protected_mode_start:
     pop esi
     lodsb
     cmp al, 0
-    je hang
+    je .waitinput
     mov bl, al
     push esi
     mov esi, letter
     call print32
     sub edi, 1920*4*11-12*4
     jmp .printlogo
+.waitinput:
+    in al, 0x64
+    test al, 1
+    jz .waitinput
+    mov edi, [framebuffer]      
+    mov eax, 0x00fff5ff
+    mov ecx, 1920*1080
+    rep stosd
+    cld
+    jmp hang
+
 print32:
     lodsb
     cmp al, bl
@@ -145,6 +150,105 @@ hang:
     hlt
     jmp $
 ;ПОМОГИТЕЕЕЕЕЕЕЕЕЕЕ SOS ME
+scankodik:
+    db 0x00
+command:
+    db 0x00
+keyboardmap:
+    db 0x02, 2   ; '1'
+    db 0x03, 3   ; '2'
+    db 0x04, 4   ; '3'
+    db 0x05, 5   ; '4'
+    db 0x06, 6   ; '5'
+    db 0x07, 7   ; '6'
+    db 0x08, 8   ; '7'
+    db 0x09, 9   ; '8'
+    db 0x0A, 22  ; '9'
+    db 0x0B, 23  ; '0'
+    db 0x0C, 24  ; '-'
+    db 0x0D, 25  ; '_'
+    db 0x10, 43  ; 'q'
+    db 0x11, 44  ; 'w'
+    db 0x12, 45  ; 'e'
+    db 0x13, 46  ; 'r'
+    db 0x14, 47  ; 't'
+    db 0x15, 48  ; 'y'
+    db 0x16, 49  ; 'u'
+    db 0x17, 52  ; 'i'
+    db 0x18, 53  ; 'o'
+    db 0x19, 54  ; 'p'
+    db 0x1A, 55  ; '['
+    db 0x1B, 56  ; ']'
+    db 0x1E, 57  ; 'a'
+    db 0x1F, 58  ; 's'
+    db 0x20, 59  ; 'd'
+    db 0x21, 62  ; 'f'
+    db 0x22, 63  ; 'g'
+    db 0x23, 64  ; 'h'
+    db 0x24, 65  ; 'j'
+    db 0x25, 66  ; 'k'
+    db 0x26, 67  ; 'l'
+    db 0x27, 68  ; ';'
+    db 0x28, 69  ; "'"
+    db 0x2B, 72  ; '\'
+    db 0x2C, 73  ; 'z'
+    db 0x2D, 74  ; 'x'
+    db 0x2E, 45  ; 'c'
+    db 0x2F, 46  ; 'v'
+    db 0x30, 44  ; 'b'
+    db 0x31, 58  ; 'n'
+    db 0x32, 57  ; 'm'
+    db 0x33, 42  ; ','
+    db 0x34, 39  ; '.'
+    db 0x35, 38  ; '/'
+    ;db 0x39, 'space' DONT LOSS SCANCODE
+keyboardmapshift: ; dont use but okay
+    db 0x02, 27  ; '!'
+    db 0x03, 28  ; '@'
+    db 0x04, 29  ; '#'
+    db 0x05, 30  ; '$'
+    db 0x06, 31  ; '%'
+    db 0x07, 32  ; '^'
+    db 0x08, 33  ; '&'
+    db 0x09, 34  ; '*'
+    db 0x0A, 35  ; '('
+    db 0x0B, 36  ; ')'
+    db 0x0C, 25  ; '_'
+    db 0x0D, 26  ; '+'
+    db 0x10, 43  ; 'Q'
+    db 0x11, 44  ; 'W'
+    db 0x12, 45  ; 'E'
+    db 0x13, 46  ; 'R'
+    db 0x14, 47  ; 'T'
+    db 0x15, 48  ; 'Y'
+    db 0x16, 49  ; 'U'
+    db 0x17, 52  ; 'I'
+    db 0x18, 53  ; 'O'
+    db 0x19, 54  ; 'P'
+    db 0x1A, 55  ; '{'
+    db 0x1B, 56  ; '}'
+    db 0x1E, 57  ; 'A'
+    db 0x1F, 58  ; 'S'
+    db 0x20, 59  ; 'D'
+    db 0x21, 62  ; 'F'
+    db 0x22, 63  ; 'G'
+    db 0x23, 64  ; 'H'
+    db 0x24, 65  ; 'J'
+    db 0x25, 66  ; 'K'
+    db 0x26, 67  ; 'L'
+    db 0x27, 68  ; ':'
+    db 0x28, 69  ; '"'
+    db 0x2B, 72  ; '|'
+    db 0x2C, 73  ; 'Z'
+    db 0x2D, 74  ; 'X'
+    db 0x2E, 45  ; 'C'
+    db 0x2F, 46  ; 'V'
+    db 0x30, 44  ; 'B'
+    db 0x31, 58  ; 'N'
+    db 0x32, 57  ; 'M'
+    db 0x33, 42  ; '<'
+    db 0x34, 39  ; '>'
+    db 0x35, 38  ; '?'
 letter:
     db 2  ; 0
     db 0x00, 0x00, 0x00, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x00, 0x00, 0x00, 0x0b
@@ -877,6 +981,7 @@ letter:
     db 0x00, 0x1f, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b
     db 0x00, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x00, 0x0b
     db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f
+    
 msg_OSname:
     db 65, 43, 55, 67, 64, 43, 0
 
@@ -1070,4 +1175,4 @@ framebuffer:
 pitch:
     dw 0
 
-times 10240 - ($ - $$) db 0
+times 20480 - ($ - $$) db 0
