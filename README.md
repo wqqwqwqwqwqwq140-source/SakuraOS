@@ -137,3 +137,8 @@ GPLV3
 ## Author
 
 Written as a low-level x86 bootloader experiment. Contributions and improvements are welcome!
+
+## Developers
+
+OS was made by:
+MatvikCoder, Pushok (The Senost) and with 5 cups of tea!
