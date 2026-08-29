@@ -101,24 +101,113 @@ protected_mode_start:
     pop esi
     lodsb
     cmp al, 0
-    je .waitinput
+    je waitinput
     mov bl, al
     push esi
     mov esi, letter
     call print32
     sub edi, 1920*4*11-12*4
     jmp .printlogo
-.waitinput:
+waitinput:
+    mov edi, command
+    mov ecx, 255
+    xor eax, eax
+    rep stosb
+    mov dword [cmd_len], 0
+    mov byte  [shift_state], 0
+
+    mov eax, [framebuffer]
+    mov [cursor_pos], eax
+
+.read_key:
     in al, 0x64
     test al, 1
-    jz .waitinput
-    mov edi, [framebuffer]      
-    mov eax, 0x00fff5ff
-    mov ecx, 1920*1080
-    rep stosd
-    cld
-    jmp hang
+    jz .read_key
 
+    in al, 0x60
+
+    test al, 0x80
+    jnz .key_up
+
+    cmp al, 0x2A
+    je .shift_on
+    cmp al, 0x36
+    je .shift_on
+    cmp al, 0x1C
+    je .enter
+    cmp al, 0x0E
+    je .backspace
+    cmp al, 0x39
+    je .space
+
+    call scancode_to_ascii   ; al(scancode) -> al(ascii), CF=1 если не найдено
+    jc .read_key
+
+    call put_char
+    jmp .read_key
+
+.key_up:
+    and al, 0x7F
+    cmp al, 0x2A
+    je .shift_off
+    cmp al, 0x36
+    je .shift_off
+    jmp .read_key
+
+.shift_on:
+    mov byte [shift_state], 1
+    jmp .read_key
+.shift_off:
+    mov byte [shift_state], 0
+    jmp .read_key
+
+.enter:
+    ; сохраняем текущий X (столбец) курсора, чтобы вычислить строку без ошибок в делении
+    mov eax, [cursor_pos]
+    sub eax, [framebuffer]      ; смещение в байтах от начала кадра
+    xor edx, edx
+    mov ecx, 1920*4
+    div ecx                      ; eax = номер строки ПИКСЕЛЕЙ, edx = смещение по X в байтах
+
+    xor edx, edx
+    mov ecx, 12
+    div ecx                      ; eax = номер строки ТЕКСТА (полных глифов), edx = остаток (игнорируем)
+
+    inc eax                      ; переходим на следующую текстовую строку
+
+    mov ecx, 1920*4*12
+    mul ecx
+
+    add eax, [framebuffer]
+    mov [cursor_pos], eax
+    
+    mov dword [cmd_len], 0
+    jmp .read_key
+
+.backspace:
+    mov eax, [cmd_len]
+    test eax, eax
+    jz .read_key
+    dec eax
+    mov [cmd_len], eax
+    mov byte [command + eax], 0
+    mov edi, [cursor_pos]
+    sub edi, 12*4
+    mov [cursor_pos], edi
+    call erase_glyph
+    jmp .read_key
+
+.space:
+    mov eax, [cmd_len]
+    cmp eax, 254
+    jae .read_key
+    mov byte [command + eax], 32
+    inc eax
+    mov [cmd_len], eax
+    mov edi, [cursor_pos]
+    add edi, 12*4
+    mov [cursor_pos], edi
+    jmp .read_key
 print32:
     lodsb
     cmp al, bl
@@ -145,110 +234,242 @@ print32:
     jmp .print32loop
 .print32end:
     ret
+; ---------------------------------------------
+; scancode_to_id
+; вход:  al = скан-код
+; выход: al = id символа, CF=0 если найдено
+;        CF=1 если не найдено
+; ---------------------------------------------
+; ---------------------------------------------
+; scancode_to_ascii: al(scancode) -> al(ascii), CF=1 если нет
+; ---------------------------------------------
+scancode_to_ascii:
+    push esi
+    push ecx
+    mov esi, ScanAsciiTable
+    mov ecx, (ScanAsciiTableEnd - ScanAsciiTable) / 3
+.loop:
+    cmp byte [esi], al
+    je .found
+    add esi, 3
+    loop .loop
+    pop ecx
+    pop esi
+    stc
+    ret
+.found:
+    cmp byte [shift_state], 0
+    je .unshift
+    mov al, [esi+2]
+    jmp .done
+.unshift:
+    mov al, [esi+1]
+.done:
+    pop ecx
+    pop esi
+    clc
+    ret
+
+; ---------------------------------------------
+; ascii_to_id: al(ascii) -> al(id), CF=1 если нет глифа
+; ---------------------------------------------
+ascii_to_id:
+    push esi
+    push ecx
+    mov esi, KeyTable
+    mov ecx, (KeyTableEnd - KeyTable) / 2
+.loop:
+    cmp byte [esi+1], al
+    je .found
+    add esi, 2
+    loop .loop
+    pop ecx
+    pop esi
+    stc
+    ret
+.found:
+    mov al, [esi]
+    pop ecx
+    pop esi
+    clc
+    ret
+
+; ---------------------------------------------
+; put_char: вход al = ASCII символа
+; ---------------------------------------------
+put_char:
+    push ebx
+    push eax             ; сохраняем оригинальный ASCII
+
+    call ascii_to_id      ; al = id (если найден)
+    jc .abort
+    mov bl, al             ; bl = id для print32
+
+    mov edi, [cmd_len]
+    cmp edi, 254
+    jae .draw
+    mov eax, [esp]
+    mov [command + edi], al
+    inc edi
+    mov [cmd_len], edi
+
+.draw:
+    xor ecx, ecx
+    mov edi, [cursor_pos]
+    push esi
+    mov esi, letter
+    call print32
+    pop esi
+
+    sub edi, 1920*4*11 + 4
+    mov [cursor_pos], edi
+
+.abort:
+    pop eax
+    pop ebx
+    ret
+erase_glyph:
+    push eax
+    push ecx
+    push edi
+    mov edi, [cursor_pos]
+    mov ecx, 11
+.row:
+    push ecx
+    mov ecx, 12
+    mov eax, 0x00fff5ff
+.col:
+    mov [edi], eax
+    add edi, 4
+    loop .col
+    pop ecx
+    add edi, 1920*4 - 12*4
+    loop .row
+    pop edi
+    pop ecx
+    pop eax
+    ret
 hang:
     cli
     hlt
     jmp $
 ;ПОМОГИТЕЕЕЕЕЕЕЕЕЕЕ SOS ME
-scankodik:
-    db 0x00
+oldxy:
+    dd 0
 command:
-    db 0x00
-keyboardmap:
-    db 0x02, 2   ; '1'
-    db 0x03, 3   ; '2'
-    db 0x04, 4   ; '3'
-    db 0x05, 5   ; '4'
-    db 0x06, 6   ; '5'
-    db 0x07, 7   ; '6'
-    db 0x08, 8   ; '7'
-    db 0x09, 9   ; '8'
-    db 0x0A, 22  ; '9'
-    db 0x0B, 23  ; '0'
-    db 0x0C, 24  ; '-'
-    db 0x0D, 25  ; '_'
-    db 0x10, 43  ; 'q'
-    db 0x11, 44  ; 'w'
-    db 0x12, 45  ; 'e'
-    db 0x13, 46  ; 'r'
-    db 0x14, 47  ; 't'
-    db 0x15, 48  ; 'y'
-    db 0x16, 49  ; 'u'
-    db 0x17, 52  ; 'i'
-    db 0x18, 53  ; 'o'
-    db 0x19, 54  ; 'p'
-    db 0x1A, 55  ; '['
-    db 0x1B, 56  ; ']'
-    db 0x1E, 57  ; 'a'
-    db 0x1F, 58  ; 's'
-    db 0x20, 59  ; 'd'
-    db 0x21, 62  ; 'f'
-    db 0x22, 63  ; 'g'
-    db 0x23, 64  ; 'h'
-    db 0x24, 65  ; 'j'
-    db 0x25, 66  ; 'k'
-    db 0x26, 67  ; 'l'
-    db 0x27, 68  ; ';'
-    db 0x28, 69  ; "'"
-    db 0x2B, 72  ; '\'
-    db 0x2C, 73  ; 'z'
-    db 0x2D, 74  ; 'x'
-    db 0x2E, 45  ; 'c'
-    db 0x2F, 46  ; 'v'
-    db 0x30, 44  ; 'b'
-    db 0x31, 58  ; 'n'
-    db 0x32, 57  ; 'm'
-    db 0x33, 42  ; ','
-    db 0x34, 39  ; '.'
-    db 0x35, 38  ; '/'
-    ;db 0x39, 'space' DONT LOSS SCANCODE
-keyboardmapshift: ; dont use but okay
-    db 0x02, 27  ; '!'
-    db 0x03, 28  ; '@'
-    db 0x04, 29  ; '#'
-    db 0x05, 30  ; '$'
-    db 0x06, 31  ; '%'
-    db 0x07, 32  ; '^'
-    db 0x08, 33  ; '&'
-    db 0x09, 34  ; '*'
-    db 0x0A, 35  ; '('
-    db 0x0B, 36  ; ')'
-    db 0x0C, 25  ; '_'
-    db 0x0D, 26  ; '+'
-    db 0x10, 43  ; 'Q'
-    db 0x11, 44  ; 'W'
-    db 0x12, 45  ; 'E'
-    db 0x13, 46  ; 'R'
-    db 0x14, 47  ; 'T'
-    db 0x15, 48  ; 'Y'
-    db 0x16, 49  ; 'U'
-    db 0x17, 52  ; 'I'
-    db 0x18, 53  ; 'O'
-    db 0x19, 54  ; 'P'
-    db 0x1A, 55  ; '{'
-    db 0x1B, 56  ; '}'
-    db 0x1E, 57  ; 'A'
-    db 0x1F, 58  ; 'S'
-    db 0x20, 59  ; 'D'
-    db 0x21, 62  ; 'F'
-    db 0x22, 63  ; 'G'
-    db 0x23, 64  ; 'H'
-    db 0x24, 65  ; 'J'
-    db 0x25, 66  ; 'K'
-    db 0x26, 67  ; 'L'
-    db 0x27, 68  ; ':'
-    db 0x28, 69  ; '"'
-    db 0x2B, 72  ; '|'
-    db 0x2C, 73  ; 'Z'
-    db 0x2D, 74  ; 'X'
-    db 0x2E, 45  ; 'C'
-    db 0x2F, 46  ; 'V'
-    db 0x30, 44  ; 'B'
-    db 0x31, 58  ; 'N'
-    db 0x32, 57  ; 'M'
-    db 0x33, 42  ; '<'
-    db 0x34, 39  ; '>'
-    db 0x35, 38  ; '?'
+    times 512 db 0
+cmd_len:
+    dd 0
+shift_state:
+    db 0
+cursor_pos:
+    dd 0
+msg_OSname:
+    db 65, 43, 55, 67, 64, 43, 0
+cmd_clear:
+    db 'Clear'
+
+; таблица id->ASCII (та, что ты прислал первой; второй столбец = ASCII символа)
+KeyTable:
+    db 2,  48 ; 0
+    db 3,  49 ; 1
+    db 4,  50 ; 2
+    db 5,  51 ; 3
+    db 6,  52 ; 4
+    db 7,  53 ; 5
+    db 8,  54 ; 6
+    db 9,  55 ; 7
+    db 22, 56 ; 8
+    db 23, 57 ; 9
+    db 24, 45 ; -
+    db 25, 95 ; _
+    db 26, 43 ; +
+    db 27, 33 ; !
+    db 28, 64 ; @
+    db 29, 35 ; #
+    db 30, 36 ; $
+    db 31, 37 ; %
+    db 32, 94 ; ^
+    db 33, 38 ; &
+    db 34, 42 ; *
+    db 35, 40 ; (
+    db 36, 41 ; )
+    db 37, 92 ; \
+    db 38, 47 ; /
+    db 39, 46 ; .
+    db 42, 44 ; ,
+    db 43, 65 ; A
+    db 44, 66 ; B
+    db 45, 67 ; C
+    db 46, 68 ; D
+    db 47, 69 ; E
+    db 48, 70 ; F
+    db 49, 71 ; G
+    db 52, 72 ; H
+    db 53, 73 ; I
+    db 54, 74 ; J
+    db 55, 75 ; K
+    db 56, 76 ; L
+    db 57, 77 ; M
+    db 58, 78 ; N
+    db 59, 79 ; O
+    db 62, 80 ; P
+    db 63, 81 ; Q
+    db 64, 82 ; R
+    db 65, 83 ; S
+    db 66, 84 ; T
+    db 67, 85 ; U
+    db 68, 86 ; V
+    db 69, 87 ; W
+    db 72, 88 ; X
+    db 73, 89 ; Y
+    db 74, 90 ; Z
+KeyTableEnd:
+
+; РЕАЛЬНЫЕ PS/2 Set1 скан-коды -> ASCII (без/с Shift)
+ScanAsciiTable:
+    db 2,  '1', '!'
+    db 3,  '2', '@'
+    db 4,  '3', '#'
+    db 5,  '4', '$'
+    db 6,  '5', '%'
+    db 7,  '6', '^'
+    db 8,  '7', '&'
+    db 9,  '8', '*'
+    db 10, '9', '('
+    db 11, '0', ')'
+    db 12, '-', '_'
+    db 16, 'Q', 'Q'
+    db 17, 'W', 'W'
+    db 18, 'E', 'E'
+    db 19, 'R', 'R'
+    db 20, 'T', 'T'
+    db 21, 'Y', 'Y'
+    db 22, 'U', 'U'
+    db 23, 'I', 'I'
+    db 24, 'O', 'O'
+    db 25, 'P', 'P'
+    db 30, 'A', 'A'
+    db 31, 'S', 'S'
+    db 32, 'D', 'D'
+    db 33, 'F', 'F'
+    db 34, 'G', 'G'
+    db 35, 'H', 'H'
+    db 36, 'J', 'J'
+    db 37, 'K', 'K'
+    db 38, 'L', 'L'
+    db 43, '\', '\'
+    db 44, 'Z', 'Z'
+    db 45, 'X', 'X'
+    db 46, 'C', 'C'
+    db 47, 'V', 'V'
+    db 48, 'B', 'B'
+    db 49, 'N', 'N'
+    db 50, 'M', 'M'
+    db 51, ',', ','
+    db 52, '.', '.'
+    db 53, '/', '/'
+ScanAsciiTableEnd:
 letter:
     db 2  ; 0
     db 0x00, 0x00, 0x00, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x00, 0x00, 0x00, 0x0b
@@ -982,8 +1203,7 @@ letter:
     db 0x00, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x00, 0x0b
     db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f
     
-msg_OSname:
-    db 65, 43, 55, 67, 64, 43, 0
+
 
 [bits 16]
 
