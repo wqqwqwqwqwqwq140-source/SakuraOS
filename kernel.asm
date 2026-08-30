@@ -109,6 +109,14 @@ protected_mode_start:
     sub edi, 1920*4*11-12*4
     jmp .printlogo
 waitinput:
+    in al, 0x64
+    test al, 1
+    jz waitinput
+    mov edi, [framebuffer]      
+    mov eax, 0x00fff5ff
+    mov ecx, 1920*1080
+    rep stosd
+.testforclear:
     mov edi, command
     mov ecx, 255
     xor eax, eax
@@ -118,7 +126,7 @@ waitinput:
 
     mov eax, [framebuffer]
     mov [cursor_pos], eax
-
+    jmp .read_key
 .read_key:
     in al, 0x64
     test al, 1
@@ -140,7 +148,7 @@ waitinput:
     cmp al, 0x39
     je .space
 
-    call scancode_to_ascii   ; al(scancode) -> al(ascii), CF=1 если не найдено
+    call scancode_to_ascii   
     jc .read_key
 
     call put_char
@@ -162,27 +170,50 @@ waitinput:
     jmp .read_key
 
 .enter:
-    ; сохраняем текущий X (столбец) курсора, чтобы вычислить строку без ошибок в делении
+    ; сохраняем текущий X (столбец) курсора
     mov eax, [cursor_pos]
-    sub eax, [framebuffer]      ; смещение в байтах от начала кадра
+    sub eax, [framebuffer]
     xor edx, edx
     mov ecx, 1920*4
-    div ecx                      ; eax = номер строки ПИКСЕЛЕЙ, edx = смещение по X в байтах
-
+    div ecx
+    
     xor edx, edx
     mov ecx, 12
-    div ecx                      ; eax = номер строки ТЕКСТА (полных глифов), edx = остаток (игнорируем)
-
-    inc eax                      ; переходим на следующую текстовую строку
-
+    div ecx
+    
+    inc eax
+    
     mov ecx, 1920*4*12
     mul ecx
-
+    
     add eax, [framebuffer]
     mov [cursor_pos], eax
-    
+    pusha
+    mov ecx, 7
+    call .checkprefix
+    popa
+
+    cmp byte [is_system], 1
+    je .do_system_command
+
     mov dword [cmd_len], 0
     jmp .read_key
+.checkprefix:
+    sub ecx, 1
+    cmp ecx, 0
+    je .systemcommand     
+    mov al, [cmdsystem + ecx]
+    cmp al, byte [command+ecx]
+    jne .othercommands
+    jmp .checkprefix
+.othercommands:
+    mov byte [is_system], 0
+    ret
+.systemcommand:
+    mov byte [is_system], 1
+    ret
+.do_system_command:
+    jmp hang
 
 .backspace:
     mov eax, [cmd_len]
@@ -224,8 +255,10 @@ print32:
     je .newline
     cmp al, 0x0f
     je .print32end
-    mov dword [edi], 0x00ff1fff
-
+    push eax
+    mov eax, [color]
+    mov dword [edi], eax
+    pop eax
     jmp .print32loop
 .newline:
     add edi, 1920 * 4
@@ -234,15 +267,6 @@ print32:
     jmp .print32loop
 .print32end:
     ret
-; ---------------------------------------------
-; scancode_to_id
-; вход:  al = скан-код
-; выход: al = id символа, CF=0 если найдено
-;        CF=1 если не найдено
-; ---------------------------------------------
-; ---------------------------------------------
-; scancode_to_ascii: al(scancode) -> al(ascii), CF=1 если нет
-; ---------------------------------------------
 scancode_to_ascii:
     push esi
     push ecx
@@ -270,9 +294,6 @@ scancode_to_ascii:
     clc
     ret
 
-; ---------------------------------------------
-; ascii_to_id: al(ascii) -> al(id), CF=1 если нет глифа
-; ---------------------------------------------
 ascii_to_id:
     push esi
     push ecx
@@ -354,6 +375,8 @@ hang:
     hlt
     jmp $
 ;ПОМОГИТЕЕЕЕЕЕЕЕЕЕЕ SOS ME
+color:
+    dd 0x00ff1fff
 oldxy:
     dd 0
 command:
@@ -366,9 +389,10 @@ cursor_pos:
     dd 0
 msg_OSname:
     db 65, 43, 55, 67, 64, 43, 0
-cmd_clear:
-    db 'Clear'
-
+cmdsystem:
+    db 'SYSTEM'
+is_system:
+    db 0
 ; таблица id->ASCII (та, что ты прислал первой; второй столбец = ASCII символа)
 KeyTable:
     db 2,  48 ; 0
