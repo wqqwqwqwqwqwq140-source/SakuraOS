@@ -418,12 +418,13 @@ protected_mode_start:
 ;по идее мы push ebx sub ecx,1 ладно разберу проще квадрат = херня с равными сторонами НО было бы лучше если бы
 ;мржно было еще по мимо квадрата рисовать прямоугольник Тогла ebx = размер по x eax = размер по y,
 testsqare:
-    mov dword [starty], 10
-    mov dword [sqarey], 500
-    mov dword [sqarex], 600
-    mov dword [startx], 20
-    mov edx, 0x00ff00ff
-    call sqare
+    mov eax, [width]
+    shr eax, 1
+    sub eax, 128
+    mov ebx, [height]
+    shr ebx, 1
+    sub ebx, 128
+    call sakura
     jmp hang
 sqare:
     ;ebx = x
@@ -469,7 +470,7 @@ sqare:
     jmp .sqarexy
 .end:
     ret
-
+%include "asm/sakura.asm"
 ;.drawtestpixel:
     ;mov ebx, [height]
     ;shr ebx, 1
@@ -508,7 +509,6 @@ paint:
 hang:
     hlt
     jmp $
-
 sqarex  dd 0
 sqarey  dd 0
 startx  dd 0
