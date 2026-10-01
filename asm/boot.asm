@@ -32,7 +32,7 @@ start:
 
 .ifos:
     mov ah, 0x02
-    mov al, 40         ; 40 секторов
+    mov al, 76         ; 40 секторов
     mov ch, 1          ; цилиндр 1
     mov cl, 1          ; сектор 1
     mov dh, 0          ; головка 0
