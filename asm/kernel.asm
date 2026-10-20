@@ -48,6 +48,8 @@ system:
 ; ну да, оххх еще прерывания, ну может сделать проще щас будет
 ; хотя квдрат проще
 ; лучше оптимизирую очитску 
+; теперь можно чистить оперативку по 1 биту и по 8
+
 pixel:
     mov  rdi, [abs framebuffer]
     mov  r10, [abs pitch]
@@ -58,14 +60,20 @@ pixel:
     ret
 
 clean:
+    cmp r8, 0x1000000
+    jb .end
     cmp ax, 0x01
     je .cleanloopbit
     cmp ax, 0x02
     je .otherbits
+    cmp ax, 0x03
+    je .bits2
+    jmp .end
+.bits2:
+    test r8, 1
+    jz .cleanloopbit2
     jmp .end
 .otherbits:
-    cmp r8, 0x1000000
-    jb .end
     cmp r8, r9
     jb .what
     jmp .end
@@ -85,6 +93,12 @@ clean:
     jae .end
     add r8, 1
     jmp .cleanloopbit
+.cleanloopbit2:
+    mov word [r8], 0
+    cmp r8, r9
+    jae .end
+    add r8, 2
+    jmp .cleanloopbit2
 .end:
     ret
 hang:
