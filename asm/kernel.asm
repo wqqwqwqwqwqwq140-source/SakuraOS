@@ -35,6 +35,7 @@ kernel_entry:
     sub rcx, 4
     jmp .fillscreen
 cleanoperate:
+    mov ax, 0x02
     mov r8, 0x1000000
     mov r9, 0x2000000
     call clean
@@ -46,17 +47,7 @@ system:
 ; ааа шрифт?
 ; ну да, оххх еще прерывания, ну может сделать проще щас будет
 ; хотя квдрат проще
-sqare:
-;r8 = x start r9 = y start эээ r10 = sizex rcx =sizey eax = калор
-    mov r11, [abs pitch]
-    mov rdi. [abs framebuffer]
-    imul r9, r11
-    mov r12, r9
-    shl r8, 2
-    add r9, r8
-.sqareloop
-    mov dword [rdi+r9]
-    
+; лучше оптимизирую очитску 
 pixel:
     mov  rdi, [abs framebuffer]
     mov  r10, [abs pitch]
@@ -67,21 +58,33 @@ pixel:
     ret
 
 clean:
+    cmp ax, 0x01
+    je .cleanloopbit
+    cmp ax, 0x02
+    je .otherbits
+    jmp .end
+.otherbits:
     cmp r8, 0x1000000
     jb .end
     cmp r8, r9
     jb .what
     jmp .end
 .what:
-    test r8, 3
+    test r8, 3 
     jz .cleanloop
     jmp .end
 .cleanloop:
-    mov qword [r8], 0x00000000
+    mov qword [r8], 0
     cmp r8, r9
     jae .end
-    add r8, 4
+    add r8, 8
     jmp .cleanloop
+.cleanloopbit:
+    mov byte [r8], 0
+    cmp r8, r9
+    jae .end
+    add r8, 1
+    jmp .cleanloopbit
 .end:
     ret
 hang:
