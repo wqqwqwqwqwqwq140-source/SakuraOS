@@ -26,7 +26,7 @@ org 0x2000000
 %define PIT_FREQ    1000
 
 %define FS_MAGIC        0x4F53464B
-%define FS_VERSION      1
+%define FS_VERSION      2
 %define FS_MAX_FILES    64
 %define FS_NAME_MAX     32
 %define FS_DATA_START   0x5000000
@@ -34,6 +34,45 @@ org 0x2000000
 %define FS_DATA_SIZE    (FS_DATA_END - FS_DATA_START)
 %define FS_INODE_SIZE   128
 %define FS_INODE_HDR    64
+%define FS_BLOCK_SIZE   4096
+%define FS_TOTAL_BLOCKS 8192
+%define FS_BITMAP_SIZE  1024
+
+%define FS_DISK_SUPER_LBA  0
+%define FS_DISK_BITMAP_LBA 1
+%define FS_DISK_INODES_LBA 3
+%define FS_DISK_DATA_LBA   19
+
+%define INO_USED        0
+%define INO_NAMELEN     8
+%define INO_SIZE        16
+%define INO_TYPE        24
+%define INO_FIRSTBLK    32
+%define INO_BLKCOUNT    40
+%define INO_CHECKSUM    48
+%define INO_RESERVED    56
+
+%define SB_MAGIC        0
+%define SB_VER          8
+%define SB_USED         16
+%define SB_USEDBLK      24
+%define SB_MAXFILES     32
+%define SB_DSTART       40
+%define SB_DEND         48
+%define SB_BLKSZ        56
+
+%define SF_MAGIC        0x00004653
+%define SF_HDR_SIZE     32
+%define SF_OFF_MAGIC    0
+%define SF_OFF_VER      4
+%define SF_OFF_TYPE     8
+%define SF_OFF_FLAGS    12
+%define SF_OFF_ENTRY    16
+%define SF_OFF_SIZE     24
+
+%define FT_RAW          0
+%define FT_SF_DATA      1
+%define FT_SF_EXEC      2
 
 %define CON_CW          8
 %define CON_CH          8
@@ -78,9 +117,6 @@ kernel_main:
     call con_flush
     call os_user_init
 .main:
-    sti
-    hlt
-    cli
     call os_user_tick
     cmp qword [con_dirty], 0
     je .main
@@ -88,15 +124,936 @@ kernel_main:
     jmp .main
 
 os_user_init:
+    lea rdi, [prompt_str]
+    call con_puts_utf8
     ret
 
 os_user_tick:
+    push rbx
     call kbd_poll_char
     test al, al
-    jz .done
-    movzx edi, al
-    call con_putc
+    jnz .key
+    cmp qword [fs_dirty], 0
+    je .done
+    mov rax, [ticks]
+    mov rbx, [last_key_tick]
+    sub rax, rbx
+    cmp rax, 200
+    jb .done
+    call fs_save
+    jmp .done
+.key:
+    mov rcx, [ticks]
+    mov [last_key_tick], rcx
+    call os_user_key
 .done:
+    pop rbx
+    ret
+
+skip_spaces:
+    cmp byte [rdi], ' '
+    jne .done
+    inc rdi
+    jmp skip_spaces
+.done:
+    ret
+
+parse_name:
+    xor rax, rax
+.loop:
+    cmp byte [rdi + rax], 0
+    je .done
+    cmp byte [rdi + rax], ' '
+    je .done
+    inc rax
+    jmp .loop
+.done:
+    add rdi, rax
+    ret
+
+con_putn:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
+.l:
+    test r12, r12
+    jz .done
+    movzx edi, byte [rbx]
+    call con_putc
+    inc rbx
+    dec r12
+    jmp .l
+.done:
+    pop r12
+    pop rbx
+    ret
+
+sf_init_hdr:
+    mov dword [rdi + SF_OFF_MAGIC], SF_MAGIC
+    mov dword [rdi + SF_OFF_VER], 1
+    mov dword [rdi + SF_OFF_TYPE], esi
+    mov dword [rdi + SF_OFF_FLAGS], 0
+    mov qword [rdi + SF_OFF_ENTRY], 0
+    mov qword [rdi + SF_OFF_SIZE], 0
+    ret
+
+os_user_key:
+    push rbx
+    movzx edi, al
+    cmp dil, 10
+    je .enter
+    cmp dil, 8
+    je .backspace
+    cmp dil, 32
+    jb .done
+    cmp qword [shell_len], 255
+    jae .done
+    mov rbx, [shell_len]
+    mov [shell_buf + rbx], dil
+    inc qword [shell_len]
+    call con_putc
+    jmp .done
+.backspace:
+    cmp qword [shell_len], 0
+    je .done
+    dec qword [shell_len]
+    call con_putc
+    jmp .done
+.enter:
+    call con_newline
+    mov rbx, [shell_len]
+    mov byte [shell_buf + rbx], 0
+    test rbx, rbx
+    jz .prompt
+    lea rdi, [shell_buf]
+    call shell_exec
+    cmp qword [fs_dirty], 0
+    je .prompt
+    call fs_save
+.prompt:
+    mov qword [shell_len], 0
+    lea rdi, [prompt_str]
+    call con_puts_utf8
+.done:
+    pop rbx
+    ret
+
+shell_exec:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    lea r13, [word_buf]
+    xor r14, r14
+.parse_word:
+    mov al, [r12]
+    test al, al
+    jz .word_done
+    cmp al, ' '
+    je .word_done
+    cmp r14, 62
+    jae .word_done
+    mov [r13 + r14], al
+    inc r14
+    inc r12
+    jmp .parse_word
+.word_done:
+    mov byte [r13 + r14], 0
+.skip_spaces:
+    cmp byte [r12], ' '
+    jne .dispatch
+    inc r12
+    jmp .skip_spaces
+.dispatch:
+    lea rdi, [r13]
+    lea rsi, [cmd_help]
+    call strcmp
+    test eax, eax
+    jz .do_help
+    lea rdi, [r13]
+    lea rsi, [cmd_clear]
+    call strcmp
+    test eax, eax
+    jz .do_clear
+    lea rdi, [r13]
+    lea rsi, [cmd_echo]
+    call strcmp
+    test eax, eax
+    jz .do_echo
+    lea rdi, [r13]
+    lea rsi, [cmd_layout]
+    call strcmp
+    test eax, eax
+    jz .do_layout
+    lea rdi, [r13]
+    lea rsi, [cmd_reboot]
+    call strcmp
+    test eax, eax
+    jz .do_reboot
+    lea rdi, [r13]
+    lea rsi, [cmd_ver]
+    call strcmp
+    test eax, eax
+    jz .do_ver
+    lea rdi, [r13]
+    lea rsi, [cmd_uptime]
+    call strcmp
+    test eax, eax
+    jz .do_uptime
+    lea rdi, [r13]
+    lea rsi, [cmd_background]
+    call strcmp
+    test eax, eax
+    jz .do_background
+    lea rdi, [r13]
+    lea rsi, [cmd_ls]
+    call strcmp
+    test eax, eax
+    jz .do_ls
+    lea rdi, [r13]
+    lea rsi, [cmd_cat]
+    call strcmp
+    test eax, eax
+    jz .do_cat
+    lea rdi, [r13]
+    lea rsi, [cmd_touch]
+    call strcmp
+    test eax, eax
+    jz .do_touch
+    lea rdi, [r13]
+    lea rsi, [cmd_rm]
+    call strcmp
+    test eax, eax
+    jz .do_rm
+    lea rdi, [r13]
+    lea rsi, [cmd_hex]
+    call strcmp
+    test eax, eax
+    jz .do_hex
+    lea rdi, [r13]
+    lea rsi, [cmd_sfnew]
+    call strcmp
+    test eax, eax
+    jz .do_sfnew
+    lea rdi, [r13]
+    lea rsi, [cmd_sfinfo]
+    call strcmp
+    test eax, eax
+    jz .do_sfinfo
+    lea rdi, [r13]
+    lea rsi, [cmd_sfwrite]
+    call strcmp
+    test eax, eax
+    jz .do_sfwrite
+    lea rdi, [r13]
+    lea rsi, [cmd_sfhello]
+    call strcmp
+    test eax, eax
+    jz .do_sfhello
+    lea rdi, [r13]
+    lea rsi, [cmd_run]
+    call strcmp
+    test eax, eax
+    jz .do_run
+    lea rdi, [r13]
+    lea rsi, [cmd_mkprog]
+    call strcmp
+    test eax, eax
+    jz .do_mkprog
+    lea rdi, [r13]
+    lea rsi, [cmd_sync]
+    call strcmp
+    test eax, eax
+    jz .do_sync
+    lea rdi, [r13]
+    lea rsi, [cmd_format]
+    call strcmp
+    test eax, eax
+    jz .do_format
+    lea rdi, [msg_unknown]
+    call con_puts_utf8
+    lea rdi, [r13]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_help:
+    lea rdi, [msg_help_text]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.do_clear:
+    call con_clear
+    jmp .done
+.do_echo:
+    mov rdi, r12
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.do_layout:
+    lea rdi, [r12]
+    lea rsi, [arg_ru]
+    call strcmp
+    test eax, eax
+    jz .set_ru
+    lea rdi, [r12]
+    lea rsi, [arg_en]
+    call strcmp
+    test eax, eax
+    jz .set_en
+    lea rdi, [msg_layout_usage]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.set_ru:
+    mov qword [kbd_layout], 1
+    lea rdi, [msg_ru_set]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.set_en:
+    mov qword [kbd_layout], 0
+    lea rdi, [msg_en_set]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.do_reboot:
+    cmp qword [fs_dirty], 0
+    je .rb
+    call fs_save
+.rb:
+    call reboot
+    jmp .done
+.do_ver:
+    lea rdi, [msg_ver]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.do_uptime:
+    lea rdi, [msg_uptime_prefix]
+    call con_puts_utf8
+    mov rdi, [ticks]
+    mov esi, 10
+    call con_putu
+    call con_newline
+    jmp .done
+.do_background:
+    mov rdi, r12
+    call skip_spaces
+    mov al, [rdi]
+    cmp al, '0'
+    je .fillblack
+    cmp al, '1'
+    je .fillwhite
+    cmp al, '2'
+    je .fillred
+    cmp al, '3'
+    je .fillgreen
+    cmp al, '4'
+    je .fillblue
+    cmp al, '5'
+    je .fillcyan
+    cmp al, '6'
+    je .fillyellow
+    cmp al, '7'
+    je .fillmagenta
+    cmp al, '8'
+    je .fillgray
+    cmp al, '9'
+    je .fillorange
+    jmp .done
+.fillblack:
+    mov eax, C_BLACK
+    jmp .fill_go
+.fillwhite:
+    mov eax, C_WHITE
+    jmp .fill_go
+.fillred:
+    mov eax, C_RED
+    jmp .fill_go
+.fillgreen:
+    mov eax, C_GREEN
+    jmp .fill_go
+.fillblue:
+    mov eax, C_BLUE
+    jmp .fill_go
+.fillcyan:
+    mov eax, C_CYAN
+    jmp .fill_go
+.fillyellow:
+    mov eax, C_YELLOW
+    jmp .fill_go
+.fillmagenta:
+    mov eax, C_MAGENTA
+    jmp .fill_go
+.fillgray:
+    mov eax, C_GRAY
+    jmp .fill_go
+.fillorange:
+    mov eax, C_ORANGE
+.fill_go:
+    call fill_screen
+    call swap_buffers
+    mov qword [con_dirty], 0
+    jmp .done
+
+.do_sync:
+    call fs_save
+    test rax, rax
+    jnz .sync_fail
+    lea rdi, [msg_synced]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.sync_fail:
+    lea rdi, [msg_disk_err]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_format:
+    call fs_format
+    call fs_save
+    mov qword [fs_dirty], 0
+    lea rdi, [msg_formatted]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_ls:
+    lea rdi, [fs_tmpbuf]
+    mov esi, 511
+    call fs_list
+    lea rdi, [fs_tmpbuf]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_cat:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    mov rdi, rbx
+    mov rsi, r14
+    call fs_lookup
+    cmp rax, -1
+    je .cat_no_file
+    mov rdi, rax
+    call fs_get_inode
+    test rax, rax
+    jz .cat_no_file
+    mov r15, rax
+    mov r13, [r15 + INO_SIZE]
+    xor r12, r12
+    cmp qword [r15 + INO_TYPE], FT_SF_DATA
+    jb .cat_size_ok
+    cmp r13, SF_HDR_SIZE
+    jbe .cat_empty
+    sub r13, SF_HDR_SIZE
+    mov r12, SF_HDR_SIZE
+.cat_size_ok:
+    test r13, r13
+    jz .cat_empty
+    mov rcx, r13
+    cmp rcx, 256
+    jbe .cat_read
+    mov rcx, 256
+.cat_read:
+    mov rdi, r15
+    mov rsi, r12
+    lea rdx, [fs_tmpbuf]
+    call fs_read_at
+    mov r13, rax
+    lea rbx, [fs_tmpbuf]
+.cat_print:
+    test r13, r13
+    jz .cat_print_done
+    movzx edi, byte [rbx]
+    test dil, dil
+    jz .cat_print_done
+    call con_putc
+    inc rbx
+    dec r13
+    jmp .cat_print
+.cat_print_done:
+    call con_newline
+    jmp .done
+.cat_empty:
+    lea rdi, [msg_empty]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.cat_no_file:
+    lea rdi, [msg_no_file]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_touch:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    mov rdi, rbx
+    mov rsi, r14
+    xor edx, edx
+    call fs_create
+    cmp rax, -1
+    je .touch_fail
+    lea rdi, [msg_created]
+    call con_puts_utf8
+    mov rdi, rbx
+    mov rsi, r14
+    call con_putn
+    call con_newline
+    jmp .done
+.touch_fail:
+    lea rdi, [msg_exists]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_rm:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    mov rdi, rbx
+    mov rsi, r14
+    call fs_delete
+    cmp rax, -1
+    je .rm_no_file
+    lea rdi, [msg_removed]
+    call con_puts_utf8
+    mov rdi, rbx
+    mov rsi, r14
+    call con_putn
+    call con_newline
+    jmp .done
+.rm_no_file:
+    lea rdi, [msg_no_file]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_hex:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    mov rdi, rbx
+    mov rsi, r14
+    call fs_lookup
+    cmp rax, -1
+    je .hex_no_file
+    mov rdi, rax
+    call fs_get_inode
+    test rax, rax
+    jz .hex_no_file
+    mov r15, rax
+    mov r13, [r15 + INO_SIZE]
+    test r13, r13
+    jz .hex_empty
+    cmp r13, 128
+    jbe .hex_read
+    mov r13, 128
+.hex_read:
+    mov rdi, r15
+    xor esi, esi
+    lea rdx, [fs_tmpbuf]
+    mov rcx, r13
+    call fs_read_at
+    mov r13, rax
+    lea rbx, [fs_tmpbuf]
+.hex_loop:
+    test r13, r13
+    jz .hex_done
+    movzx edi, byte [rbx]
+    mov esi, 16
+    call con_putu
+    mov edi, ' '
+    call con_putc
+    inc rbx
+    dec r13
+    jmp .hex_loop
+.hex_done:
+    call con_newline
+    jmp .done
+.hex_empty:
+    lea rdi, [msg_empty]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.hex_no_file:
+    lea rdi, [msg_no_file]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_sfnew:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    call skip_spaces
+    mov r12, rdi
+    call parse_name
+    mov rcx, rax
+    mov edx, FT_SF_DATA
+    cmp rcx, 4
+    jne .sfnew_create
+    cmp byte [r12 + 0], 'e'
+    jne .sfnew_create
+    cmp byte [r12 + 1], 'x'
+    jne .sfnew_create
+    cmp byte [r12 + 2], 'e'
+    jne .sfnew_create
+    cmp byte [r12 + 3], 'c'
+    jne .sfnew_create
+    mov edx, FT_SF_EXEC
+.sfnew_create:
+    mov rdi, rbx
+    mov rsi, r14
+    push rdx
+    call fs_create
+    pop rdx
+    cmp rax, -1
+    je .sfnew_fail
+    mov r15, rax
+    lea rdi, [fs_tmpbuf]
+    mov esi, edx
+    call sf_init_hdr
+    mov rdi, r15
+    lea rsi, [fs_tmpbuf]
+    mov edx, SF_HDR_SIZE
+    call fs_write
+    lea rdi, [msg_created]
+    call con_puts_utf8
+    mov rdi, rbx
+    mov rsi, r14
+    call con_putn
+    call con_newline
+    jmp .done
+.sfnew_fail:
+    lea rdi, [msg_exists]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_sfinfo:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    mov rdi, rbx
+    mov rsi, r14
+    call fs_lookup
+    cmp rax, -1
+    je .sfinfo_no_file
+    mov rdi, rax
+    call fs_get_inode
+    test rax, rax
+    jz .sfinfo_no_file
+    mov r15, rax
+    mov rax, [r15 + INO_SIZE]
+    cmp rax, SF_HDR_SIZE
+    jb .sfinfo_bad
+    mov rdi, r15
+    xor esi, esi
+    lea rdx, [fs_tmpbuf]
+    mov ecx, SF_HDR_SIZE
+    call fs_read_at
+    lea rbx, [fs_tmpbuf]
+    cmp dword [rbx + SF_OFF_MAGIC], SF_MAGIC
+    jne .sfinfo_bad
+    lea rdi, [msg_sf_magic]
+    call con_puts_utf8
+    mov edi, [rbx + SF_OFF_MAGIC]
+    mov esi, 16
+    call con_putu
+    call con_newline
+    lea rdi, [msg_sf_ver]
+    call con_puts_utf8
+    mov edi, [rbx + SF_OFF_VER]
+    mov esi, 10
+    call con_putu
+    call con_newline
+    lea rdi, [msg_sf_type]
+    call con_puts_utf8
+    mov edi, [rbx + SF_OFF_TYPE]
+    mov esi, 10
+    call con_putu
+    call con_newline
+    lea rdi, [msg_sf_entry]
+    call con_puts_utf8
+    mov rdi, [rbx + SF_OFF_ENTRY]
+    mov esi, 16
+    call con_putu
+    call con_newline
+    lea rdi, [msg_sf_size]
+    call con_puts_utf8
+    mov rdi, [rbx + SF_OFF_SIZE]
+    mov esi, 10
+    call con_putu
+    call con_newline
+    jmp .done
+.sfinfo_bad:
+    lea rdi, [msg_sf_bad]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.sfinfo_no_file:
+    lea rdi, [msg_no_file]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_sfwrite:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    call skip_spaces
+    mov r12, rdi
+    mov rdi, rbx
+    mov rsi, r14
+    call fs_lookup
+    cmp rax, -1
+    je .sfwrite_no_file
+    mov r15, rax
+    mov rdi, r15
+    call fs_get_inode
+    test rax, rax
+    jz .sfwrite_no_file
+    mov r13, rax
+    cmp qword [r13 + INO_TYPE], FT_SF_DATA
+    jb .sfwrite_not_sf
+    lea rdi, [fs_tmpbuf + SF_HDR_SIZE]
+    mov rsi, r12
+    xor ecx, ecx
+.sfwrite_cp:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .sfwrite_cp_done
+    inc rsi
+    inc rdi
+    inc rcx
+    cmp rcx, 400
+    jae .sfwrite_cp_done
+    jmp .sfwrite_cp
+.sfwrite_cp_done:
+    push rcx
+    lea rdi, [fs_tmpbuf]
+    mov esi, FT_SF_DATA
+    call sf_init_hdr
+    pop rcx
+    lea rdi, [fs_tmpbuf]
+    mov [rdi + SF_OFF_SIZE], rcx
+    add rcx, SF_HDR_SIZE
+    mov rdi, r15
+    lea rsi, [fs_tmpbuf]
+    mov rdx, rcx
+    call fs_write
+    lea rdi, [msg_created]
+    call con_puts_utf8
+    mov rdi, rbx
+    mov rsi, r14
+    call con_putn
+    call con_newline
+    jmp .done
+.sfwrite_not_sf:
+    lea rdi, [msg_sf_bad]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.sfwrite_no_file:
+    lea rdi, [msg_no_file]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_sfhello:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    mov rdi, rbx
+    mov rsi, r14
+    mov edx, FT_SF_EXEC
+    call fs_create
+    cmp rax, -1
+    je .sfhello_fail
+    mov r15, rax
+    lea rdi, [fs_tmpbuf]
+    mov esi, FT_SF_EXEC
+    call sf_init_hdr
+    mov r13d, sf_hello_code_end - sf_hello_code
+    lea rsi, [sf_hello_code]
+    lea rdi, [fs_tmpbuf + SF_HDR_SIZE]
+    mov ecx, r13d
+    cld
+    rep movsb
+    lea rdi, [fs_tmpbuf]
+    mov [rdi + SF_OFF_SIZE], r13
+    mov rdi, r15
+    lea rsi, [fs_tmpbuf]
+    mov edx, r13d
+    add edx, SF_HDR_SIZE
+    call fs_write
+    lea rdi, [msg_created]
+    call con_puts_utf8
+    mov rdi, rbx
+    mov rsi, r14
+    call con_putn
+    call con_newline
+    jmp .done
+.sfhello_fail:
+    lea rdi, [msg_exists]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_mkprog:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    mov rdi, rbx
+    mov rsi, r14
+    mov edx, FT_SF_EXEC
+    call fs_create
+    cmp rax, -1
+    je .mkprog_fail
+    mov r15, rax
+    lea rdi, [fs_tmpbuf]
+    mov esi, FT_SF_EXEC
+    call sf_init_hdr
+    mov r13d, prog_hi_code_end - prog_hi_code
+    lea rsi, [prog_hi_code]
+    lea rdi, [fs_tmpbuf + SF_HDR_SIZE]
+    mov ecx, r13d
+    cld
+    rep movsb
+    lea rdi, [fs_tmpbuf]
+    mov [rdi + SF_OFF_SIZE], r13
+    mov rdi, r15
+    lea rsi, [fs_tmpbuf]
+    mov edx, r13d
+    add edx, SF_HDR_SIZE
+    call fs_write
+    lea rdi, [msg_created]
+    call con_puts_utf8
+    mov rdi, rbx
+    mov rsi, r14
+    call con_putn
+    call con_newline
+    jmp .done
+.mkprog_fail:
+    lea rdi, [msg_exists]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.do_run:
+    mov rdi, r12
+    call skip_spaces
+    mov rbx, rdi
+    call parse_name
+    mov r14, rax
+    test r14, r14
+    jz .done
+    mov rdi, rbx
+    mov rsi, r14
+    call fs_lookup
+    cmp rax, -1
+    je .run_no_file
+    mov r15, rax
+    mov rdi, r15
+    call fs_get_inode
+    test rax, rax
+    jz .run_no_file
+    mov r13, rax
+    cmp qword [r13 + INO_TYPE], FT_SF_EXEC
+    jne .run_not_exec
+    mov rax, [r13 + INO_SIZE]
+    cmp rax, SF_HDR_SIZE
+    jb .run_no_file
+    mov rdi, r13
+    xor esi, esi
+    lea rdx, [fs_tmpbuf]
+    mov ecx, SF_HDR_SIZE
+    call fs_read_at
+    lea rbx, [fs_tmpbuf]
+    cmp dword [rbx + SF_OFF_MAGIC], SF_MAGIC
+    jne .run_bad_magic
+    lea rdi, [msg_running]
+    call con_puts_utf8
+    mov rdi, r15
+    mov rsi, r14
+    call con_putn
+    call con_newline
+    mov rax, [r13 + INO_FIRSTBLK]
+    shl rax, 12
+    add rax, FS_DATA_START
+    add rax, SF_HDR_SIZE
+    mov rcx, [rbx + SF_OFF_ENTRY]
+    add rax, rcx
+    call rax
+    jmp .done
+.run_no_file:
+    lea rdi, [msg_no_file]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.run_not_exec:
+    lea rdi, [msg_not_exec]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+.run_bad_magic:
+    lea rdi, [msg_sf_bad]
+    call con_puts_utf8
+    call con_newline
+    jmp .done
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 panic:
@@ -150,6 +1107,9 @@ init_idt:
     add rdi, 16
     dec rcx
     jnz .fill
+    lea rdi, [idt + 0x13*16]
+    lea rax, [isr_syscall]
+    call .set_entry
     lea rdi, [idt + 0x20*16]
     lea rax, [irq_timer]
     call .set_entry
@@ -231,6 +1191,10 @@ irq_keyboard:
     je .shift_off
     cmp al, 0xB6
     je .shift_off
+    cmp al, 0x38
+    je .alt_on
+    cmp al, 0xB8
+    je .alt_off
     test al, 0x80
     jnz .release
     cmp eax, 127
@@ -279,9 +1243,29 @@ irq_keyboard:
     jmp .release
 .shift_on:
     mov qword [kbd_shift], 1
+    cmp qword [kbd_alt], 0
+    je .release
+    cmp qword [alt_toggled], 0
+    jne .release
+    mov qword [alt_toggled], 1
+    xor qword [kbd_layout], 1
     jmp .release
 .shift_off:
     mov qword [kbd_shift], 0
+    mov qword [alt_toggled], 0
+    jmp .release
+.alt_on:
+    mov qword [kbd_alt], 1
+    cmp qword [kbd_shift], 0
+    je .release
+    cmp qword [alt_toggled], 0
+    jne .release
+    mov qword [alt_toggled], 1
+    xor qword [kbd_layout], 1
+    jmp .release
+.alt_off:
+    mov qword [kbd_alt], 0
+    mov qword [alt_toggled], 0
 .release:
     mov al, 0x20
     out 0x20, al
@@ -289,6 +1273,422 @@ irq_keyboard:
     pop rbx
     pop rax
     iretq
+
+isr_syscall:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    sti
+    mov r10, rax
+    shr r10, 8
+    and r10, 0xFF
+    cmp r10d, 0x00
+    je .sys_pixel
+    cmp r10d, 0x01
+    je .sys_text
+    cmp r10d, 0x02
+    je .sys_fill
+    cmp r10d, 0x03
+    je .sys_fillrect
+    cmp r10d, 0x04
+    je .sys_line
+    cmp r10d, 0x05
+    je .sys_rect
+    cmp r10d, 0x06
+    je .sys_swap
+    cmp r10d, 0x07
+    je .sys_putc
+    cmp r10d, 0x08
+    je .sys_puts
+    cmp r10d, 0x09
+    je .sys_putu
+    cmp r10d, 0x0A
+    je .sys_nl
+    cmp r10d, 0x0B
+    je .sys_clear
+    cmp r10d, 0x0C
+    je .sys_gotoxy
+    cmp r10d, 0x0D
+    je .sys_getc
+    cmp r10d, 0x0E
+    je .sys_getc_nb
+    cmp r10d, 0x0F
+    je .sys_delay
+    cmp r10d, 0x10
+    je .sys_ticks
+    cmp r10d, 0x11
+    je .sys_fs_open
+    cmp r10d, 0x12
+    je .sys_fs_read
+    cmp r10d, 0x13
+    je .sys_fs_write
+    cmp r10d, 0x14
+    je .sys_fs_close
+    cmp r10d, 0x15
+    je .sys_fs_seek
+    cmp r10d, 0x16
+    je .sys_fs_create
+    cmp r10d, 0x17
+    je .sys_fs_delete
+    cmp r10d, 0x18
+    je .sys_exit
+    cmp r10d, 0x19
+    je .sys_get_screen
+    jmp .sys_done
+.sys_pixel:
+    mov eax, ebx
+    mov r8, rcx
+    mov r9, rdx
+    call pixel
+    jmp .sys_done
+.sys_text:
+    mov eax, ebx
+    mov r8, rcx
+    mov r9, rdx
+    mov rdi, rsi
+    call draw_text
+    jmp .sys_done
+.sys_fill:
+    mov eax, ebx
+    call fill_screen
+    jmp .sys_done
+.sys_fillrect:
+    mov eax, ebx
+    mov r8, rcx
+    mov r9, rdx
+    mov r10, rsi
+    mov r11, rdi
+    call fill_rect
+    jmp .sys_done
+.sys_line:
+    mov eax, ebx
+    mov r8, rcx
+    mov r9, rdx
+    mov r10, rsi
+    mov r11, rdi
+    call draw_line
+    jmp .sys_done
+.sys_rect:
+    mov eax, ebx
+    mov r8, rcx
+    mov r9, rdx
+    mov r10, rsi
+    mov r11, rdi
+    call draw_rect
+    jmp .sys_done
+.sys_swap:
+    call swap_buffers
+    jmp .sys_done
+.sys_putc:
+    movzx edi, bl
+    call con_putc
+    jmp .sys_done
+.sys_puts:
+    mov rdi, rsi
+    call con_puts_utf8
+    jmp .sys_done
+.sys_putu:
+    mov rdi, rbx
+    movzx esi, al
+    call con_putu
+    jmp .sys_done
+.sys_nl:
+    call con_newline
+    jmp .sys_done
+.sys_clear:
+    call con_clear
+    jmp .sys_done
+.sys_gotoxy:
+    mov rdi, rcx
+    mov rsi, rdx
+    call con_gotoxy
+    jmp .sys_done
+.sys_getc:
+    call kbd_getchar
+    movzx eax, al
+    jmp .sys_done
+.sys_getc_nb:
+    call kbd_poll_char
+    movzx eax, al
+    jmp .sys_done
+.sys_delay:
+    mov rdi, rbx
+    call delay_ms
+    jmp .sys_done
+.sys_ticks:
+    call get_ticks
+    jmp .sys_done
+.sys_fs_open:
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rdi, rsi
+    mov rsi, rdx
+    call fs_lookup
+    cmp rax, -1
+    je .sys_fs_err
+    mov rdi, rax
+    call fs_get_inode
+    mov rdi, rax
+    call fs_open
+    jmp .sys_done
+.sys_fs_read:
+    mov rdi, rbx
+    mov rsi, rcx
+    mov rdx, rdx
+    call fs_read
+    jmp .sys_done
+.sys_fs_write:
+    mov rdi, rbx
+    mov rsi, rcx
+    mov rdx, rdx
+    call fs_write
+    jmp .sys_done
+.sys_fs_close:
+    mov rdi, rbx
+    call fs_close
+    jmp .sys_done
+.sys_fs_seek:
+    mov rdi, rbx
+    mov rsi, rcx
+    call fs_seek
+    jmp .sys_done
+.sys_fs_create:
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rdi, rsi
+    mov rsi, rdx
+    mov edx, FT_SF_DATA
+    call fs_create
+    jmp .sys_done
+.sys_fs_delete:
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rdi, rsi
+    mov rsi, rdx
+    call fs_delete
+    jmp .sys_done
+.sys_fs_err:
+    mov rax, -1
+    jmp .sys_done
+.sys_get_screen:
+    mov rax, [width]     ; возвращаем ширину в rax
+    mov rbx, [height]    ; возвращаем высоту в rbx
+    mov rcx, [pitch]     ; возвращаем pitch в rcx
+    jmp .sys_done
+.sys_exit:
+    cli
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    iretq
+.sys_done:
+    cli
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    iretq
+ata_wait_bsy:
+    push rcx
+    push rdx
+    mov dx, 0x177
+    mov rcx, 0x100000
+.poll:
+    in al, dx
+    cmp al, 0xFF
+    je .fail
+    test al, 0x80
+    jz .ready
+    dec rcx
+    jnz .poll
+.fail:
+    mov rax, -1
+    jmp .done
+.ready:
+    xor eax, eax
+.done:
+    pop rdx
+    pop rcx
+    ret
+
+ata_wait_drq:
+    push rcx
+    push rdx
+    mov dx, 0x177
+    mov rcx, 0x1000000
+.poll:
+    in al, dx
+    cmp al, 0xFF
+    je .fail
+    test al, 0x80
+    jnz .next
+    test al, 0x08
+    jnz .ready
+.next:
+    dec rcx
+    jnz .poll
+.fail:
+    mov rax, -1
+    jmp .done
+.ready:
+    xor eax, eax
+.done:
+    pop rdx
+    pop rcx
+    ret
+
+ata_read_sector:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi
+    mov r13, rsi
+    call ata_wait_bsy
+    test rax, rax
+    jnz .err
+    mov rax, r12
+    shr rax, 24
+    and al, 0x0F
+    or al, 0xE0
+    mov dx, 0x176
+    out dx, al
+    mov dx, 0x172
+    mov al, 1
+    out dx, al
+    mov rax, r12
+    mov dx, 0x173
+    out dx, al
+    shr rax, 8
+    mov dx, 0x174
+    out dx, al
+    shr rax, 8
+    mov dx, 0x175
+    out dx, al
+    mov dx, 0x177
+    mov al, 0x20
+    out dx, al
+    call ata_wait_drq
+    test rax, rax
+    jnz .err
+    mov rdi, r13
+    mov dx, 0x170
+    mov rcx, 256
+    cld
+    rep insw
+    xor eax, eax
+    jmp .done
+.err:
+    mov rax, -1
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+ata_write_sector:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi
+    mov r13, rsi
+    call ata_wait_bsy
+    test rax, rax
+    jnz .err
+    mov rax, r12
+    shr rax, 24
+    and al, 0x0F
+    or al, 0xE0
+    mov dx, 0x176
+    out dx, al
+    mov dx, 0x172
+    mov al, 1
+    out dx, al
+    mov rax, r12
+    mov dx, 0x173
+    out dx, al
+    shr rax, 8
+    mov dx, 0x174
+    out dx, al
+    shr rax, 8
+    mov dx, 0x175
+    out dx, al
+    mov dx, 0x177
+    mov al, 0x30
+    out dx, al
+    call ata_wait_drq
+    test rax, rax
+    jnz .err
+    mov rsi, r13
+    mov dx, 0x170
+    mov rcx, 256
+    cld
+    rep outsw
+    xor eax, eax
+    jmp .done
+.err:
+    mov rax, -1
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+ata_flush:
+    push rcx
+    push rdx
+    mov dx, 0x177
+    mov al, 0xE7
+    out dx, al
+    mov rcx, 0x1000000
+.w:
+    in al, dx
+    test al, 0x80
+    jz .done
+    dec rcx
+    jnz .w
+.done:
+    pop rdx
+    pop rcx
+    ret
 
 kmalloc:
     push rbx
@@ -1257,10 +2657,173 @@ delay_ms:
     ret
 
 fs_init:
-    cmp qword [fs_super], FS_MAGIC
-    je .ok
+    call fs_load
+    cmp qword [fs_super + SB_MAGIC], FS_MAGIC
+    jne .format
+    cmp qword [fs_super + SB_VER], FS_VERSION
+    jne .format
+    mov qword [fs_dirty], 0
+    ret
+.format:
     call fs_format
+    call fs_save
+    mov qword [fs_dirty], 0
+    ret
+
+fs_save:
+    push rbx
+    push r12
+    push r13
+    lea rsi, [fs_super]
+    mov rdi, FS_DISK_SUPER_LBA
+    call ata_write_sector
+    test rax, rax
+    jnz .err
+    lea rsi, [fs_bitmap]
+    mov rdi, FS_DISK_BITMAP_LBA
+    call ata_write_sector
+    test rax, rax
+    jnz .err
+    lea rsi, [fs_bitmap + 512]
+    mov rdi, FS_DISK_BITMAP_LBA + 1
+    call ata_write_sector
+    test rax, rax
+    jnz .err
+    xor r12, r12
+.inode_loop:
+    cmp r12, 16
+    jae .data_start
+    mov rbx, r12
+    shl rbx, 9
+    lea rsi, [fs_inodes + rbx]
+    mov rdi, FS_DISK_INODES_LBA
+    add rdi, r12
+    call ata_write_sector
+    test rax, rax
+    jnz .err
+    inc r12
+    jmp .inode_loop
+.data_start:
+    xor r12, r12
+.block_loop:
+    cmp r12, FS_TOTAL_BLOCKS
+    jae .flush
+    mov rdi, r12
+    call fs_test_bit
+    test al, al
+    jz .next_block
+    xor r13, r13
+.sector_loop:
+    cmp r13, 8
+    jae .next_block
+    mov rsi, r12
+    shl rsi, 12
+    add rsi, FS_DATA_START
+    mov rax, r13
+    shl rax, 9
+    add rsi, rax
+    mov rdi, r12
+    shl rdi, 3
+    add rdi, FS_DISK_DATA_LBA
+    add rdi, r13
+    call ata_write_sector
+    test rax, rax
+    jnz .err
+    inc r13
+    jmp .sector_loop
+.next_block:
+    inc r12
+    jmp .block_loop
+.flush:
+    call ata_flush
+    mov qword [fs_dirty], 0
+    xor eax, eax
+    jmp .done
+.err:
+    mov rax, -1
+.done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+fs_load:
+    push rbx
+    push r12
+    push r13
+    lea rsi, [fs_super]
+    mov rdi, FS_DISK_SUPER_LBA
+    call ata_read_sector
+    test rax, rax
+    jnz .err
+    cmp qword [fs_super + SB_MAGIC], FS_MAGIC
+    jne .err
+    cmp qword [fs_super + SB_VER], FS_VERSION
+    jne .err
+    lea rsi, [fs_bitmap]
+    mov rdi, FS_DISK_BITMAP_LBA
+    call ata_read_sector
+    test rax, rax
+    jnz .err
+    lea rsi, [fs_bitmap + 512]
+    mov rdi, FS_DISK_BITMAP_LBA + 1
+    call ata_read_sector
+    test rax, rax
+    jnz .err
+    xor r12, r12
+.inode_loop:
+    cmp r12, 16
+    jae .data_start
+    mov rbx, r12
+    shl rbx, 9
+    lea rsi, [fs_inodes + rbx]
+    mov rdi, FS_DISK_INODES_LBA
+    add rdi, r12
+    call ata_read_sector
+    test rax, rax
+    jnz .err
+    inc r12
+    jmp .inode_loop
+.data_start:
+    xor r12, r12
+.block_loop:
+    cmp r12, FS_TOTAL_BLOCKS
+    jae .ok
+    mov rdi, r12
+    call fs_test_bit
+    test al, al
+    jz .next_block
+    xor r13, r13
+.sector_loop:
+    cmp r13, 8
+    jae .next_block
+    mov rsi, r12
+    shl rsi, 12
+    add rsi, FS_DATA_START
+    mov rax, r13
+    shl rax, 9
+    add rsi, rax
+    mov rdi, r12
+    shl rdi, 3
+    add rdi, FS_DISK_DATA_LBA
+    add rdi, r13
+    call ata_read_sector
+    test rax, rax
+    jnz .err
+    inc r13
+    jmp .sector_loop
+.next_block:
+    inc r12
+    jmp .block_loop
 .ok:
+    xor eax, eax
+    jmp .done
+.err:
+    mov rax, -1
+.done:
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 fs_format:
@@ -1268,22 +2831,157 @@ fs_format:
     push rcx
     push rax
     lea rdi, [fs_super]
-    mov qword [rdi + 0], FS_MAGIC
-    mov qword [rdi + 8], FS_VERSION
-    mov qword [rdi + 16], 0
-    mov qword [rdi + 24], 0
-    mov qword [rdi + 32], FS_MAX_FILES
-    mov qword [rdi + 40], FS_DATA_START
-    mov qword [rdi + 48], FS_DATA_END
-    mov qword [rdi + 56], 0
+    mov qword [rdi + SB_MAGIC], FS_MAGIC
+    mov qword [rdi + SB_VER], FS_VERSION
+    mov qword [rdi + SB_USED], 0
+    mov qword [rdi + SB_USEDBLK], 0
+    mov qword [rdi + SB_MAXFILES], FS_MAX_FILES
+    mov qword [rdi + SB_DSTART], FS_DATA_START
+    mov qword [rdi + SB_DEND], FS_DATA_END
+    mov qword [rdi + SB_BLKSZ], FS_BLOCK_SIZE
     lea rdi, [fs_inodes]
     mov rcx, FS_INODE_SIZE * FS_MAX_FILES / 8
     xor rax, rax
     cld
     rep stosq
+    lea rdi, [fs_bitmap]
+    mov rcx, FS_BITMAP_SIZE / 8
+    rep stosq
     pop rax
     pop rcx
     pop rdi
+    ret
+
+fs_test_bit:
+    push rbx
+    push rcx
+    mov rbx, rdi
+    shr rbx, 3
+    mov rcx, rdi
+    and rcx, 7
+    lea rdx, [fs_bitmap]
+    mov al, [rdx + rbx]
+    shr al, cl
+    and al, 1
+    pop rcx
+    pop rbx
+    ret
+
+fs_set_bit:
+    push rbx
+    push rcx
+    push rdx
+    mov rbx, rdi
+    shr rbx, 3
+    mov rcx, rdi
+    and rcx, 7
+    mov dl, 1
+    shl dl, cl
+    lea rax, [fs_bitmap]
+    or [rax + rbx], dl
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+fs_clear_bit:
+    push rbx
+    push rcx
+    push rdx
+    mov rbx, rdi
+    shr rbx, 3
+    mov rcx, rdi
+    and rcx, 7
+    mov dl, 1
+    shl dl, cl
+    not dl
+    lea rax, [fs_bitmap]
+    and [rax + rbx], dl
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+fs_alloc_blocks:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    mov r8, rdi
+    test r8, r8
+    jz .fail
+    xor r9, r9
+.find_start:
+    mov rax, r9
+    add rax, r8
+    cmp rax, FS_TOTAL_BLOCKS
+    ja .fail
+    xor r10, r10
+.check:
+    cmp r10, r8
+    jae .found
+    mov rdi, r9
+    add rdi, r10
+    call fs_test_bit
+    test al, al
+    jnz .next_start
+    inc r10
+    jmp .check
+.found:
+    xor r10, r10
+.mark:
+    cmp r10, r8
+    jae .done
+    mov rdi, r9
+    add rdi, r10
+    call fs_set_bit
+    inc r10
+    jmp .mark
+.next_start:
+    inc r9
+    jmp .find_start
+.fail:
+    mov rax, -1
+    jmp .out
+.done:
+    mov rax, r9
+    add [fs_super + SB_USEDBLK], r8
+.out:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+fs_free_blocks:
+    push rbx
+    push rcx
+    push rdi
+    push rsi
+    mov rbx, rdi
+    mov rcx, rsi
+    test rcx, rcx
+    jz .done
+.l:
+    mov rdi, rbx
+    call fs_clear_bit
+    inc rbx
+    dec rcx
+    jnz .l
+    sub [fs_super + SB_USEDBLK], rsi
+.done:
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rbx
     ret
 
 fs_new_inode:
@@ -1297,7 +2995,7 @@ fs_new_inode:
     imul rdx, rax, FS_INODE_SIZE
     lea rbx, [fs_inodes]
     add rbx, rdx
-    cmp qword [rbx + 0], 0
+    cmp qword [rbx + INO_USED], 0
     je .found
     inc rax
     jmp .l
@@ -1340,17 +3038,16 @@ fs_lookup:
     push rdi
     mov r8, rdi
     mov r9, rsi
-    mov r10, [fs_super + 16]
     xor r11, r11
 .loop:
-    cmp r11, r10
+    cmp r11, FS_MAX_FILES
     jae .fail
     imul rax, r11, FS_INODE_SIZE
     lea rdi, [fs_inodes]
     add rdi, rax
-    cmp qword [rdi + 0], 0
+    cmp qword [rdi + INO_USED], 0
     je .next
-    mov rcx, [rdi + 8]
+    mov rcx, [rdi + INO_NAMELEN]
     cmp rcx, r9
     jne .next
     add rdi, FS_INODE_HDR
@@ -1390,7 +3087,7 @@ fs_create:
     mov r12, rdi
     mov r13, rsi
     mov r14, rdx
-    mov rax, [fs_super + 16]
+    mov rax, [fs_super + SB_USED]
     cmp rax, FS_MAX_FILES
     jae .fail
     mov rdi, r12
@@ -1405,13 +3102,12 @@ fs_create:
     mov rdi, r15
     call fs_get_inode
     mov rbx, rax
-    mov qword [rbx + 0], 1
-    mov [rbx + 8], r13
-    mov qword [rbx + 16], 0
-    mov [rbx + 24], r14
-    mov qword [rbx + 32], 0
-    mov qword [rbx + 40], 0
-    mov qword [rbx + 48], 0
+    mov qword [rbx + INO_USED], 1
+    mov [rbx + INO_NAMELEN], r13
+    mov qword [rbx + INO_SIZE], 0
+    mov [rbx + INO_TYPE], r14
+    mov qword [rbx + INO_FIRSTBLK], 0
+    mov qword [rbx + INO_BLKCOUNT], 0
     lea rdi, [rbx + FS_INODE_HDR]
     mov rsi, r12
     mov rcx, r13
@@ -1424,8 +3120,9 @@ fs_create:
     lea rdi, [rbx + FS_INODE_HDR]
     mov rsi, FS_NAME_MAX
     call fs_checksum
-    mov [rbx + 40], rax
-    inc qword [fs_super + 16]
+    mov [rbx + INO_CHECKSUM], rax
+    inc qword [fs_super + SB_USED]
+    mov qword [fs_dirty], 1
     mov rax, r15
     jmp .done
 .fail:
@@ -1463,6 +3160,50 @@ fs_seek:
     mov rax, -1
     ret
 
+fs_read_at:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov r13, rsi
+    mov r14, rdx
+    mov r15, rcx
+    mov rax, [r12 + INO_SIZE]
+    sub rax, r13
+    jbe .eof
+    cmp rax, r15
+    jbe .have
+    mov rax, r15
+.have:
+    mov r8, rax
+    mov rax, r13
+    xor rdx, rdx
+    mov rcx, FS_BLOCK_SIZE
+    div rcx
+    mov r9, [r12 + INO_FIRSTBLK]
+    add r9, rax
+    shl r9, 12
+    add r9, FS_DATA_START
+    add r9, rdx
+    mov rdi, r14
+    mov rsi, r9
+    mov rcx, r8
+    cld
+    rep movsb
+    mov rax, r8
+    jmp .done
+.eof:
+    xor eax, eax
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 fs_read:
     push rbx
     push r12
@@ -1479,35 +3220,22 @@ fs_read:
     test rax, rax
     jz .fail
     mov rbx, rax
-    cmp qword [rbx + 0], 0
+    cmp qword [rbx + INO_USED], 0
     je .fail
     imul rdx, r14, 4
     lea rcx, [fs_fd_pos]
     mov r15d, [rcx + rdx]
-    mov rax, [rbx + 16]
-    sub rax, r15
-    jbe .eof
-    cmp rax, r13
-    jbe .have
-    mov rax, r13
-.have:
-    mov r8, rax
-    mov r9, [rbx + 32]
-    add r9, FS_DATA_START
-    add r9, r15
-    mov rdi, r12
-    mov rsi, r9
-    mov rcx, r8
-    cld
-    rep movsb
-    add r15, r8
+    mov rdi, rbx
+    mov rsi, r15
+    mov rdx, r12
+    mov rcx, r13
+    call fs_read_at
+    test rax, rax
+    jz .done
+    add r15, rax
     imul rdx, r14, 4
     lea rcx, [fs_fd_pos]
     mov [rcx + rdx], r15d
-    mov rax, r8
-    jmp .done
-.eof:
-    xor eax, eax
     jmp .done
 .fail:
     mov rax, -1
@@ -1525,45 +3253,85 @@ fs_write:
     push r13
     push r14
     push r15
-    mov r14, rdi
-    mov r12, rsi
-    mov r13, rdx
-    cmp r14, FS_MAX_FILES
+    mov r12, rdi
+    mov r13, rsi
+    mov r14, rdx
+    cmp r12, FS_MAX_FILES
     jae .fail
-    mov rdi, r14
+    mov rdi, r12
     call fs_get_inode
     test rax, rax
     jz .fail
     mov rbx, rax
-    cmp qword [rbx + 0], 0
+    cmp qword [rbx + INO_USED], 0
     je .fail
-    cmp qword [rbx + 32], 0
-    je .new_alloc
-    cmp qword [rbx + 48], 0
-    je .new_alloc
-    cmp [rbx + 48], r13
-    jae .do_copy
-.new_alloc:
-    mov rdi, [fs_super + 24]
-    add rdi, r13
-    cmp rdi, FS_DATA_SIZE
-    ja .fail
-    mov rax, [fs_super + 24]
-    mov [rbx + 32], rax
-    mov [rbx + 48], r13
-    mov rdi, [fs_super + 24]
-    add rdi, r13
-    mov [fs_super + 24], rdi
-.do_copy:
-    mov r15, [rbx + 32]
-    add r15, FS_DATA_START
+    mov rax, r14
+    add rax, FS_BLOCK_SIZE - 1
+    xor rdx, rdx
+    mov rcx, FS_BLOCK_SIZE
+    div rcx
+    mov r15, rax
+    test r15, r15
+    jnz .need_alloc
+    mov rdi, [rbx + INO_FIRSTBLK]
+    mov rsi, [rbx + INO_BLKCOUNT]
+    test rsi, rsi
+    jz .zero_done
+    call fs_free_blocks
+.zero_done:
+    mov qword [rbx + INO_FIRSTBLK], 0
+    mov qword [rbx + INO_BLKCOUNT], 0
+    mov qword [rbx + INO_SIZE], 0
+    mov qword [fs_dirty], 1
+    xor eax, eax
+    jmp .done
+.need_alloc:
+    cmp r15, [rbx + INO_BLKCOUNT]
+    ja .realloc
+    cmp qword [rbx + INO_FIRSTBLK], 0
+    je .realloc
+    mov r8, [rbx + INO_FIRSTBLK]
+    jmp .copy
+.realloc:
     mov rdi, r15
-    mov rsi, r12
-    mov rcx, r13
+    call fs_alloc_blocks
+    cmp rax, -1
+    je .fail
+    mov r8, rax
+    push qword [rbx + INO_FIRSTBLK]
+    push qword [rbx + INO_BLKCOUNT]
+    mov [rbx + INO_FIRSTBLK], r8
+    mov [rbx + INO_BLKCOUNT], r15
+    mov rdi, r8
+    shl rdi, 12
+    add rdi, FS_DATA_START
+    mov rsi, r13
+    mov rcx, r14
     cld
     rep movsb
-    mov [rbx + 16], r13
-    mov rax, r13
+    pop rsi
+    pop rdi
+    test rsi, rsi
+    jz .realloc_done
+    test rdi, rdi
+    jz .realloc_done
+    call fs_free_blocks
+.realloc_done:
+    mov [rbx + INO_SIZE], r14
+    mov qword [fs_dirty], 1
+    mov rax, r14
+    jmp .done
+.copy:
+    mov rdi, r8
+    shl rdi, 12
+    add rdi, FS_DATA_START
+    mov rsi, r13
+    mov rcx, r14
+    cld
+    rep movsb
+    mov [rbx + INO_SIZE], r14
+    mov qword [fs_dirty], 1
+    mov rax, r14
     jmp .done
 .fail:
     mov rax, -1
@@ -1578,16 +3346,27 @@ fs_write:
 fs_delete:
     push rbx
     push r12
-    mov r12, rdi
     call fs_lookup
     cmp rax, -1
     je .fail
+    mov r12, rax
     mov rdi, rax
     call fs_get_inode
-    mov qword [rax + 0], 0
-    mov qword [rax + 32], 0
-    mov qword [rax + 48], 0
-    dec qword [fs_super + 16]
+    test rax, rax
+    jz .fail
+    mov rbx, rax
+    mov rdi, [rbx + INO_FIRSTBLK]
+    mov rsi, [rbx + INO_BLKCOUNT]
+    test rsi, rsi
+    jz .no_blocks
+    call fs_free_blocks
+.no_blocks:
+    mov qword [rbx + INO_USED], 0
+    mov qword [rbx + INO_FIRSTBLK], 0
+    mov qword [rbx + INO_BLKCOUNT], 0
+    mov qword [rbx + INO_SIZE], 0
+    dec qword [fs_super + SB_USED]
+    mov qword [fs_dirty], 1
     xor eax, eax
     jmp .done
 .fail:
@@ -1613,9 +3392,9 @@ fs_list:
     imul rax, r15, FS_INODE_SIZE
     lea rbx, [fs_inodes]
     add rbx, rax
-    cmp qword [rbx + 0], 0
+    cmp qword [rbx + INO_USED], 0
     je .next
-    mov rcx, [rbx + 8]
+    mov rcx, [rbx + INO_NAMELEN]
     mov rax, r14
     add rax, rcx
     add rax, 2
@@ -1649,7 +3428,7 @@ fs_list:
 
 section .data
 align 16
-
+prompt_str  db "> ", 0
 framebuffer     dq 0
 width           dq 0
 height          dq 0
@@ -1662,12 +3441,20 @@ render_pitch    dq 0
 heap_cur        dq 0
 
 ticks           dq 0
+last_key_tick   dq 0
+fs_dirty        dq 0
 
 key_head        dq 0
 key_tail        dq 0
 key_buffer      times 16 db 0
 kbd_layout      dq 0
 kbd_shift       dq 0
+kbd_alt         dq 0
+alt_toggled     dq 0
+shell_buf       times 256 db 0
+shell_len       dq 0
+word_buf        times 64 db 0
+fs_tmpbuf       times 512 db 0
 
 con_textbuf     dq 0
 con_cols        dq 0
@@ -1682,10 +3469,15 @@ save_color      dd 0
 save_x1         dq 0
 save_y1         dq 0
 
+align 512
 fs_super:
     times 64 db 0
 
-align 16
+align 512
+fs_bitmap:
+    times FS_BITMAP_SIZE db 0
+
+align 512
 fs_inodes:
     times (FS_INODE_SIZE * FS_MAX_FILES) db 0
 
@@ -1693,8 +3485,84 @@ align 16
 fs_fd_pos:
     times (FS_MAX_FILES * 4) db 0
 
-msg_kernel_loaded db "Ядро загруженно!", 0
+msg_kernel_loaded db "Ядро загружено! ", 0
 msg_panic         db "PANIC: ", 0
+
+cmd_help        db "help", 0
+cmd_clear       db "clear", 0
+cmd_echo        db "echo", 0
+cmd_layout      db "layout", 0
+cmd_reboot      db "reboot", 0
+cmd_ver         db "ver", 0
+cmd_uptime      db "uptime", 0
+cmd_background  db "background", 0
+cmd_ls          db "ls", 0
+cmd_cat         db "cat", 0
+cmd_touch       db "touch", 0
+cmd_rm          db "rm", 0
+cmd_hex         db "hex", 0
+cmd_sfnew       db "sfnew", 0
+cmd_sfinfo      db "sfinfo", 0
+cmd_sfwrite     db "sfwrite", 0
+cmd_sfhello     db "sfhello", 0
+cmd_run         db "run", 0
+cmd_mkprog      db "mkprog", 0
+cmd_sync        db "sync", 0
+cmd_format      db "format", 0
+arg_ru          db "ru", 0
+arg_en          db "en", 0
+
+msg_help_text db "FS: ls, cat <f>, touch <f>, rm <f>, hex <f>", 10
+              db "SF: sfnew, sfinfo, sfwrite, sfhello, mkprog, run", 10
+              db "Disk: sync, format", 10
+              db "Sys: help, clear, echo, layout <en|ru>, ver, uptime, reboot, background <0-9>", 0
+msg_unknown       db "Unknown command: ", 0
+msg_layout_usage  db "Usage: layout <en|ru>", 0
+msg_ru_set        db "Layout: RU", 0
+msg_en_set        db "Layout: EN", 0
+msg_ver           db "OS alpha v0.7 (int 0x13 syscalls)", 0
+msg_uptime_prefix db "Ticks: ", 0
+msg_no_file       db "No such file", 0
+msg_empty         db "(empty)", 0
+msg_sf_bad        db "Bad SF header", 0
+msg_created       db "Created: ", 0
+msg_removed       db "Removed: ", 0
+msg_exists        db "Already exists", 0
+msg_not_exec      db "Not an SF executable", 0
+msg_running       db "Running: ", 0
+msg_synced        db "Saved to disk", 0
+msg_formatted     db "FS formatted and saved", 0
+msg_disk_err      db "Disk write error", 0
+msg_sf_magic      db "  magic:   0x", 0
+msg_sf_ver        db "  version: ", 0
+msg_sf_type       db "  type:    ", 0
+msg_sf_entry      db "  entry:   0x", 0
+msg_sf_size       db "  size:    ", 0
+
+align 16
+sf_hello_code:
+    mov rdi, sf_hello_msg
+    mov rax, con_puts
+    call rax
+    mov edi, 10
+    mov rax, con_putc
+    call rax
+    ret
+sf_hello_code_end:
+sf_hello_msg: db "Hello from SF!", 0
+
+align 16
+prog_hi_code:
+    lea rdi, [rel prog_hi_msg]
+    mov rax, con_puts_utf8
+    call rax
+    mov edi, 10
+    mov rax, con_putc
+    call rax
+    ret
+prog_hi_code_end:
+prog_hi_msg:
+    db "Привет мир!", 0
 
 align 16
 idt:
